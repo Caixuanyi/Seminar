@@ -1,0 +1,244 @@
+rm(list=ls())
+
+required <- c("dplyr", "ggplot2", "isotone", "readxl", "gridExtra")
+to_install <- setdiff(required, installed.packages()[, "Package"])
+if (length(to_install)) install.packages(to_install)
+lapply(required, library, character.only = TRUE)
+
+nllind <- function(probs, labels) {
+  eps <- 1e-12
+  p   <- pmin(pmax(probs, eps), 1 - eps)
+  -mean(labels * log(p) + (1 - labels) * log(1 - p))
+}
+brierind <- function(probs, labels) {
+  mean((labels - probs)^2)
+}
+eceind <- function(probs, labels, n_bins = 5) {
+  cuts    <- seq(0, 1, length.out = n_bins + 1)
+  bins    <- cut(probs, breaks = cuts, include.lowest = TRUE)
+  df0     <- data.frame(probs, labels, bin = bins)
+  summary <- df0 %>%
+    group_by(bin) %>%
+    summarize(avg_p = mean(probs),
+              acc   = mean(labels),
+              count = n(), .groups = "drop")
+  w <- summary$count / nrow(df0)
+  sum(w * abs(summary$avg_p - summary$acc))
+}
+
+platt_cal <- function(cal_p, cal_y, test_p) {
+  m <- glm(cal_y ~ cal_p, family = binomial(link = "logit"))
+  predict(m, newdata = data.frame(cal_p = test_p), type = "response")
+}
+isotonic_cal <- function(cal_p, cal_y, test_p) {
+  ord <- order(cal_p)
+  fit <- gpava(z = cal_p[ord], y = cal_y[ord], solver = weighted.mean)
+  f   <- approxfun(fit$z, fit$x, rule = 2)
+  f(test_p)
+}
+temperature_cal <- function(cal_logits, cal_y, test_logits) {
+  sigmoid <- function(z, T) 1 / (1 + exp(-z / T))
+  obj     <- function(T) nllind(sigmoid(cal_logits, T), cal_y)
+  T_opt   <- optimize(obj, interval = c(0.1, 5))$minimum
+  sigmoid(test_logits, T_opt)
+}
+
+plot_reliability <- function(test_data, response = "y", n_bins = 5) {
+  bins <- seq(0, 1, length.out = n_bins + 1)
+  mids <- (bins[-1] + bins[-length(bins)]) / 2
+  
+  get_acc <- function(p) {
+    b <- cut(p, breaks = bins, include.lowest = TRUE)
+    tapply(test_data[[response]], b, mean)
+  }
+  
+  acc_unc  <- get_acc(test_data$uncalibrated)
+  acc_pl   <- get_acc(test_data$platt)
+  acc_iso  <- get_acc(test_data$isotonic)
+  acc_temp <- get_acc(test_data$temperature)
+  
+  df <- data.frame(
+    bin    = rep(mids, 5),
+    acc    = c(mids, acc_unc, acc_pl, acc_iso, acc_temp),
+    method = factor(
+      rep(c("Ideal", "Uncalibrated", "Platt", "Isotonic", "Temperature"),
+          each = n_bins),
+      levels = c("Ideal", "Uncalibrated", "Platt", "Isotonic", "Temperature")
+    )
+  )
+  
+  ggplot(df, aes(x = bin, y = acc, color = method)) +
+    geom_line(data = subset(df, method == "Ideal"), size = 1.2) +
+    geom_point(data = subset(df, method != "Ideal"), size = 3) +
+    geom_smooth(
+      data = subset(df, method != "Ideal"),
+      aes(group = method), method = "loess", se = FALSE, linetype = "dashed"
+    ) +
+    scale_color_manual(values = c(
+      Ideal        = "black",
+      Uncalibrated = "red",
+      Platt        = "blue",
+      Isotonic     = "green",
+      Temperature  = "purple"
+    )) +
+    labs(
+      title = "Reliability Diagram (5 bins + LOESS + Ideal)",
+      x     = "Predicted Probability",
+      y     = "Empirical Accuracy",
+      color = "Method"
+    ) +
+    theme_minimal(base_size = 14)
+}
+
+run_calibration_sim <- function(data) {
+  n  <- nrow(data)
+  i1 <- floor(0.6 * n)
+  i2 <- floor(0.8 * n)
+  
+  train <- data[1:i1, ]
+  cal   <- data[(i1 + 1):i2, ]
+  test  <- data[(i2 + 1):n, ]
+  
+  mod <- glm(y ~ ., data = train, family = binomial)
+  test$uncalibrated <- predict(mod, newdata = test, type = "response")
+  
+  cal_p     <- predict(mod, newdata = cal, type = "response")
+  cal_logit <- predict(mod, newdata = cal, type = "link")
+  test_logit<- predict(mod, newdata = test, type = "link")
+  
+  test$platt       <- platt_cal(cal_p, cal$y, test$uncalibrated)
+  test$isotonic    <- isotonic_cal(cal_p, cal$y, test$uncalibrated)
+  test$temperature <- temperature_cal(cal_logit, cal$y, test_logit)
+  
+  eval_one <- function(name, p) {
+    data.frame(
+      Method = name,
+      NLL    = nllind(p, test$y),
+      Brier  = brierind(p, test$y),
+      ECE    = eceind(p, test$y)
+    )
+  }
+  results <- bind_rows(
+    eval_one("Uncalibrated", test$uncalibrated),
+    eval_one("Platt",       test$platt),
+    eval_one("Isotonic",    test$isotonic),
+    eval_one("Temperature", test$temperature)
+  )
+  
+  const_p  <- rep(0.5, nrow(test))
+  const_res <- data.frame(
+    Method = "Constant_0.5",
+    NLL    = nllind(const_p, test$y),
+    Brier  = brierind(const_p, test$y),
+    ECE    = eceind(const_p, test$y)
+  )
+  
+  list(
+    results   = results,
+    const     = const_res,
+    test_data = test
+  )
+}
+
+set.seed(20250705)
+n_total <- 252 * 10
+gen_dt   <- function(seed, sd) {
+  set.seed(seed)
+  X     <- matrix(rnorm(n_total * 4), n_total, 4)
+  logit <- X %*% c(0.6, 0.8, -0.5, -0.2) + rnorm(n_total, sd = sd)
+  y     <- rbinom(n_total, 1, plogis(logit))
+  data.frame(y = y, X)
+}
+
+sim1 <- run_calibration_sim(gen_dt(123, sd = 0))
+sim2 <- run_calibration_sim(gen_dt(456, sd = 0.5))
+
+print(sim1$results)
+print(sim1$const)  
+print(sim2$results)
+print(sim2$const)
+
+plot_reliability(sim1$test_data)
+plot_reliability(sim2$test_data)
+
+run_calibration_real <- function(df, response = "Y") {
+  n  <- nrow(df)
+  i1 <- floor(0.6 * n)
+  i2 <- floor(0.8 * n)
+  
+  train <- df[1:i1, ]
+  cal   <- df[(i1 + 1):i2, ]
+  test  <- df[(i2 + 1):n, ]
+  
+  fml     <- reformulate(setdiff(names(df), response), response)
+  base_mod<- glm(fml, data = train, family = binomial)
+  test$uncalibrated <- predict(base_mod, newdata = test, type = "response")
+  
+  cal_p     <- predict(base_mod, newdata = cal, type = "response")
+  cal_logit <- predict(base_mod, newdata = cal, type = "link")
+  test_logit<- predict(base_mod, newdata = test, type = "link")
+  
+  test$platt       <- platt_cal(cal_p, cal[[response]], test$uncalibrated)
+  test$isotonic    <- isotonic_cal(cal_p, cal[[response]], test$uncalibrated)
+  test$temperature <- temperature_cal(cal_logit, cal[[response]], test_logit)
+  
+  eval_one <- function(name, p) {
+    data.frame(
+      Method = name,
+      NLL    = nllind(p, test[[response]]),
+      Brier  = brierind(p, test[[response]]),
+      ECE    = eceind(p, test[[response]])
+    )
+  }
+  results <- bind_rows(
+    eval_one("Uncalibrated", test$uncalibrated),
+    eval_one("Platt",       test$platt),
+    eval_one("Isotonic",    test$isotonic),
+    eval_one("Temperature", test$temperature)
+  )
+  
+  list(results   = results,
+       test_data = test)
+}
+
+fn <- "default_of_credit_card_clients.xls"
+if (!file.exists(fn)) {
+  download.file(
+    "https://archive.ics.uci.edu/ml/machine-learning-databases/00350/default%20of%20credit%20card%20clients.xls",
+    fn, mode = "wb"
+  )
+}
+raw <- read_xls(fn, skip = 1)
+df  <- raw %>%
+  rename(Y = `default payment next month`) %>%
+  mutate(across(everything(), as.numeric))
+
+real <- run_calibration_real(df, response = "Y")
+
+print(real$results)
+
+const_p_real <- rep(0.5, nrow(real$test_data))
+metrics_const_real <- data.frame(
+  Method = "Constant_0.5",
+  NLL    = nllind(const_p_real, real$test_data$Y),
+  Brier  = brierind(const_p_real, real$test_data$Y),
+  ECE    = eceind(const_p_real, real$test_data$Y)
+)
+print(metrics_const_real)
+
+p0 <- mean(real$test_data$Y)
+const_pred0 <- rep(p0, nrow(real$test_data))
+
+const_res0 <- data.frame(
+  Method = "Constant_prevalence",
+  NLL    = nllind(const_pred0, real$test_data$Y),
+  Brier  = brierind(const_pred0, real$test_data$Y),
+  ECE    = eceind(const_pred0, real$test_data$Y)
+)
+print(const_res0)
+
+plot_reliability(real$test_data, response = "Y")
+
+p0 <- mean(real$test_data$Y)
+const_pred0 <- rep(p0, nrow(real$test_data))
+ggsave("reliability_plot.png", plot = last_plot(), width = 8, height = 6)
