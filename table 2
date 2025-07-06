@@ -1,0 +1,153 @@
+rm(list=ls())
+
+library(dplyr)
+library(ggplot2)
+library(caret)
+library(isotone)
+library(gridExtra)
+
+n=252*10
+n_train=252*6  
+n_calibrate=252*2  
+n_test=252*2  
+
+gen_dt_shift=function( 
+    seed=20250702,n,shift_point,intercept=1,
+    coef=c(0.6, 0.8, -0.5, -0.2),
+    sd=0.5){
+  set.seed(seed)
+  p=length(coef)
+  X=matrix(rnorm(n * p), n, p)
+  logit=X %*% coef+rnorm(n, sd=sd)
+  logit[(shift_point+1):n]=logit[(shift_point+1):n]+intercept
+  y=rbinom(n, size=1, prob=plogis(logit))
+  gendata=data.frame(y=y, X=X)
+  return(gendata)
+}
+
+nllind=function(probs,labels){
+  probs=pmin(pmax(probs,0.0000000000001), 1-0.0000000000001)
+  nll=-mean(labels*log(probs) + (1-labels) * log(1 - probs))
+  return(nll)
+}
+
+brierind=function(probs,labels){
+  brier=mean((labels - probs)^2)
+  return(brier)
+}
+
+eceind=function(probs,labels,n_bins=5){
+  breaks=seq(0, 1, length.out=n_bins + 1)
+  bins=cut(probs, breaks=breaks,include.lowest=TRUE)
+  bin_data=data.frame(prob=probs,label=labels,bin=bins)
+  bin_summary=bin_data %>% group_by(bin) %>%
+    reframe(avg_prob=mean(prob),
+            acc=mean(label),
+            count=n())
+  weight= bin_summary$count/nrow(bin_data)
+  due=abs(bin_summary$avg_prob-bin_summary$acc)
+  ece=sum(weight*due)
+  return(ece)
+}
+
+platt_cal=function(calibrate_probs = 0.5,
+                   calibrate_labels,
+                   test_probs){
+  dt=data.frame(calibrate_labels=calibrate_labels,
+                calibrate_probs=calibrate_probs)
+  model=glm(calibrate_labels ~ calibrate_probs,data=dt,
+            family=binomial(link="logit"))
+  calibdt=data.frame(calibrate_probs=test_probs)
+  preddata= predict(model, newdata=calibdt, type="response")
+  return(preddata)
+}
+
+isotonic_cal=function(calibrate_probs = 0.5, 
+                      calibrate_labels, 
+                      test_probs){
+  ord=order(calibrate_probs)
+  iso_fit=gpava(z=calibrate_probs[ord],
+                y=calibrate_labels[ord],
+                solver=weighted.mean)
+  funct=approxfun(iso_fit$z, iso_fit$x, method="linear", rule=2)
+  isodata= funct(test_probs)
+  return(isodata)
+}
+
+temperature_cal=function(calibrate_logits, 
+                         calibrate_labels, 
+                         test_logits){
+  sigmoid_Temp=function(logits,Temp){1/(1+exp(-logits/Temp))}
+  objfun=function(Temp){
+    cal_probs=sigmoid_Temp(calibrate_logits, Temp)
+    objective=nllind(cal_probs,calibrate_labels)
+    return(objective)
+  }
+  optim_T=optimize(objfun,interval=c(0.1, 5))
+  sigmoid_Temp(test_logits, optim_T$minimum)
+}
+resu=function(data){
+  train_data=data[1:n_train, ]
+  test_data=data[(n_train + 1):(n_train + n_test), ]
+  calibrate_data=data[(n_train + n_test + 1):(n_train + n_test + n_calibrate), ]
+  logit_model=glm(y~., data=train_data, family=binomial)
+  test_data$uncalibrated=predict(logit_model, newdata=test_data, type="response")
+  NLL=nllind(test_data$uncalibrated, test_data$y)
+  Brier=brierind(test_data$uncalibrated, test_data$y)
+  ECE=eceind(test_data$uncalibrated, test_data$y)
+  metrics_uncal=data.frame(
+    Method="Uncalibrated",
+    NLL=NLL,
+    Brier=Brier,
+    ECE=ECE
+  )
+  t1=predict(logit_model, calibrate_data, type="response")
+  test_data$platt=platt_cal(
+    t1,
+    calibrate_data$y,
+    test_data$uncalibrated
+  )
+  t2=predict(logit_model, calibrate_data, type="response")
+  test_data$isotonic=isotonic_cal(
+    t2,
+    calibrate_data$y,
+    test_data$uncalibrated
+  )
+  calibrate_logits=predict(logit_model, 
+                           calibrate_data, type="link")
+  test_logits=predict(logit_model, 
+                      test_data, type="link")
+  test_data$temperature=temperature_cal(
+    calibrate_logits,
+    calibrate_data$y,
+    test_logits
+  )
+  evaluate_method=function(method_name, probs){
+    NLL=nllind(probs, test_data$y)
+    Brier=brierind(probs, test_data$y)
+    ECE=eceind(probs, test_data$y)
+    metrics=data.frame(
+      Method=method_name,
+      NLL=NLL,Brier=Brier,ECE=ECE
+    )
+    return(metrics)
+  }
+  metrics_cal=rbind(    evaluate_method("Platt", test_data$platt),
+                        evaluate_method("Isotonic", test_data$isotonic),
+                        evaluate_method("Temperature", test_data$temperature)
+  )
+  results=rbind(metrics_uncal, metrics_cal)
+  output=list(results=results, test_data=test_data)
+  return(output)
+}
+
+data_platt=gen_dt_shift(n=n, shift_point = n_train, 
+                                   intercept = 1)
+result_platt <- resu(data_platt)
+print(result_platt$results)
+
+result_platt$results$Best = ifelse(result_platt$results$Method == "Platt",T,F)
+ggplot(result_platt$results,aes(Method, NLL, fill = Best)) +
+  geom_col(width = 0.6) +
+  labs(title = "Performance of NLL index for different calibrate method",) +
+  theme_minimal()
