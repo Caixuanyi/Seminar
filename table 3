@@ -1,0 +1,135 @@
+rm(list=ls())
+
+library(dplyr)
+library(ggplot2)
+library(caret)
+library(isotone)
+library(gridExtra)
+
+n_total=252*10
+n_train=252*6  
+n_calibrate=252*2  
+n_test=252*2  
+n_bins_ece=15 
+
+desired_order=c("Uncalibrated", "Platt", "Isotonic", "Temperature")
+
+gen_dt_nonlinear=function(n, seed=20250703,
+                             sd=0.5) {
+  set.seed(seed)
+  X1=rnorm(n)
+  X2=rnorm(n)
+  X3=rnorm(n)
+  X4=rnorm(n)
+  logit=2.8*X1-3.8*(X1^3)+2*sin(1.2*X2)+1.6*X2^2-1.1*X3+rnorm(n,sd = sd)
+  y=rbinom(n, size=1, prob=plogis(logit))
+  gendata=data.frame(y=y, X1, X2, X3, X4)
+  return(gendata)
+}
+
+nllind=function(probs,labels){
+  probs=pmin(pmax(probs,0.0000000000001), 1-0.0000000000001)
+  nll=-mean(labels*log(probs) + (1-labels) * log(1 - probs))
+  return(nll)
+}
+
+brierind=function(probs,labels){
+  brier=mean((labels - probs)^2)
+  return(brier)
+}
+
+eceind=function(probs,labels,n_bins=15){
+  breaks=seq(0, 1, length.out=n_bins + 1)
+  bins=cut(probs, breaks=breaks,include.lowest=TRUE)
+  bin_data=data.frame(prob=probs,label=labels,bin=bins)
+  bin_summary=bin_data %>% group_by(bin) %>%
+    reframe(avg_prob=mean(prob),
+            acc=mean(label),
+            count=n())
+  weight= bin_summary$count/nrow(bin_data)
+  due=abs(bin_summary$avg_prob-bin_summary$acc)
+  ece=sum(weight*due)
+  return(ece)
+}
+
+platt_cal=function(calibrate_probs = 0.5,
+                   calibrate_labels,
+                   test_probs){
+  dt=data.frame(calibrate_labels=calibrate_labels,
+                calibrate_probs=calibrate_probs)
+  model=glm(calibrate_labels ~ calibrate_probs,data=dt,
+            family=binomial(link="logit"))
+  calibdt=data.frame(calibrate_probs=test_probs)
+  preddata= predict(model, newdata=calibdt, type="response")
+  return(preddata)
+}
+
+isotonic_cal=function(calibrate_probs = 0.5, 
+                      calibrate_labels, 
+                      test_probs){
+  ord=order(calibrate_probs)
+  iso_fit=gpava(z=calibrate_probs[ord],
+                y=calibrate_labels[ord],
+                solver=weighted.mean)
+  funct=approxfun(iso_fit$z, iso_fit$x, method="linear", rule=2)
+  isodata= funct(test_probs)
+  return(isodata)
+}
+
+temperature_cal=function(calibrate_logits, 
+                         calibrate_labels, 
+                         test_logits){
+  sigmoid_Temp=function(logits,Temp){1/(1+exp(-logits/Temp))}
+  objfun=function(Temp){
+    cal_probs=sigmoid_Temp(calibrate_logits, Temp)
+    objective=nllind(cal_probs,calibrate_labels)
+    return(objective)
+  }
+  optim_T=optimize(objfun,interval=c(0.1, 5))
+  sigmoid_Temp(test_logits, optim_T$minimum)
+}
+
+run_one=function(seed) {
+  data=gen_dt_nonlinear(n_total, seed = seed)
+  train=data[1:n_train, ]
+  calib=data[(n_train + 1):(n_train + n_calibrate), ]
+  test =data[(n_train + n_calibrate + 1):n_total, ]
+  
+  base =glm(y ~., data = train, family = binomial)
+  test_p =predict(base, test,  type = "response")
+  calib_p=predict(base, calib, type = "response")
+  test_l =predict(base, test,  type = "link")
+  calib_l=predict(base, calib, type = "link")
+  
+  uncal=test_p
+  platt=platt_cal(calib_p, calib$y, test_p)
+  isot =isotonic_cal(calib_p, calib$y, test_p)
+  temp =temperature_cal(calib_l, calib$y, test_l)
+  outputdata=data.frame(Method=c("Uncalibrated", "Platt", "Isotonic", "Temperature"),
+                        NLL=c(nllind(uncal, test$y),
+                                   nllind(platt, test$y),
+                                   nllind(isot,  test$y),
+                                   nllind(temp,  test$y)),
+                        Brier=c(brierind(uncal, test$y),
+                                   brierind(platt, test$y),
+                                   brierind(isot,  test$y),
+                                   brierind(temp,  test$y)),
+                        ECE=c(eceind(uncal, test$y),
+                                   eceind(platt, test$y),
+                                   eceind(isot,  test$y),
+                                   eceind(temp,  test$y)))
+  return(outputdata)
+}
+
+onetime=run_one(999)
+onetime
+
+seeds=1:30
+all_runs=map_dfr(seeds, run_one)
+all_runs_index_mean=all_runs %>%
+  group_by(Method) %>%
+  reframe(Mean_NLL =mean(NLL),
+          Mean_Brier=mean(Brier),
+          Mean_ECE=mean(ECE)
+          )
+all_runs_index_mean
