@@ -1,0 +1,61 @@
+rm(list=ls())
+
+library(dplyr)
+library(ggplot2)
+library(caret)
+library(isotone)
+library(gridExtra)
+
+n=252*10
+n_train=252*6  
+n_calibrate=252*2  
+n_test=252*2  
+
+gen_dt=function( 
+    seed=20250702,n,
+    coef=c(0.6, 0.8, -0.5, -0.2),
+    sd=0.5){
+  set.seed(seed)
+  p=length(coef)
+  X=matrix(rnorm(n * p), n, p)
+  logit=X %*% coef+rnorm(n, sd=sd)
+  y=rbinom(n, size=1, prob=plogis(logit))
+  gendata=data.frame(y=y, X=X)
+  return(gendata)
+}
+
+plot_uncal_rel=function(df, title_tag, n_bins = 5){
+  train_data=df[1:n_train, ]
+  test_data=df[(n_train + 1):(n_train + n_test), ]
+  logit_model=glm(y~., data=train_data, family=binomial)
+  p=predict(logit_model, newdata=test_data, type="response")
+  breaks=seq(0,1,length.out = n_bins+1)
+  bins = cut(p, breaks, include.lowest = TRUE)
+  bin_data=data.frame(p=p,y=test_data$y,bin=bins)
+  stats=bin_data %>%
+    group_by(bin) %>%
+    reframe(prob = mean(p), 
+            acc = mean(y))
+  ggplot(stats, aes(x = prob, y = acc)) +
+    geom_line(col = "grey50") +
+    geom_point(size = 3, col = "steelblue") +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+    coord_equal() +
+    labs(title = paste("Uncalibrated –", title_tag),
+         x = "Predicted probability",
+         y = "Empirical accuracy") +
+    theme_minimal()
+}
+
+dt1 = gen_dt(seed = 123, n = n, sd = 0.0)
+dt2 = gen_dt(seed = 456, n = n, sd = 0.5)
+grid.arrange(
+  plot_uncal_rel(dt1, "Ideal Model"),
+  plot_uncal_rel(dt2, "Misspecified Model"),ncol=2
+)
+png("reliability_comparison.png", width = 1000, height = 500)
+grid.arrange(
+  plot_uncal_rel(dt1, "Ideal Model"),
+  plot_uncal_rel(dt2, "Misspecified Model"), ncol=2
+)
+dev.off()
